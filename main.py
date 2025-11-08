@@ -50,6 +50,36 @@ def invalid_query_hex_truncated(request):
         request.path += b"?query=%A"
 
 
+def remove_auth_parameters(request):
+    """Corrupt the request by removing all auth parameters."""
+    path_parts = request.path.split(b"?", 1)
+
+    # Remove query parameters related to SigV4 authentication
+    if len(path_parts) == 2:
+        path = path_parts[0]
+        query = path_parts[1]
+        query_keep = []
+        for param in query.split(b"&", 1):
+            lparam = param.lower()
+            key = lparam.split(b"=", 1)[0]
+
+            if key not in (
+                b"x-amz-algorithm",
+                b"x-amz-credential",
+                b"x-amz-signature",
+                b"x-amz-date",
+                b"x-amz-signedheaders",
+            ):
+                query_keep.append(param)
+
+        request.path = path + b"?" + b"&".join(query_keep)
+
+    # Remove any authorization header
+    for header in list(request.headers.keys()):
+        if header.lower() == b"authorization":
+            del request.headers[header]
+
+
 class TestStsOrdering(TestCase):
     """Test how STS behaves with various malformed requests."""
 
@@ -71,7 +101,9 @@ class TestStsOrdering(TestCase):
             body=body,
             config=self.config,
         )
-        request.add_sigv4_auth(signed_headers=(b"host", b"x-amz-date", b"x-amz-content-sha256"))
+        request.add_sigv4_auth(
+            signed_headers=(b"host", b"x-amz-date", b"x-amz-content-sha256")
+        )
 
         with create_ssl_socket(self.config.get("host"), 443) as ssl_socket:
             request_bytes = request.to_bytes()
@@ -91,6 +123,7 @@ class TestStsOrdering(TestCase):
                 invalid_content_type,
                 invalid_query_hex_escape,
                 invalid_query_hex_truncated,
+                remove_auth_parameters,
             ):
 
                 with self.subTest(
@@ -136,6 +169,7 @@ class TestStsOrdering(TestCase):
             invalid_content_type,
             invalid_query_hex_escape,
             invalid_query_hex_truncated,
+            remove_auth_parameters,
         ):
             with self.subTest(corruptor=corruptor.__name__):
                 body = b"Action=GetCallerIdentity&Version=2011-06-15"
@@ -164,6 +198,35 @@ class TestStsOrdering(TestCase):
                     ssl_socket.sendall(request_bytes)
                     response = ssl_socket.read(4096)
                     self.assertStartsWith(response, b"HTTP/1.1 302 Found\r\n")
+
+    def test_missing_auth_parameters(self):
+        """Test requests with missing authentication parameters."""
+        body = b"Action=GetCallerIdentity&Version=2011-06-15"
+        body_hash = sha256(body).hexdigest()
+        request = Request(
+            method="POST",
+            path=self.config.get("path").encode("utf-8"),
+            headers={
+                b"host": self.config.get("host").encode("utf-8"),
+                b"content-type": b"application/x-www-form-urlencoded; charset=utf-8",
+            },
+            body=body,
+            config=self.config,
+        )
+        request.add_sigv4_auth(
+            signed_headers=(b"host", b"x-amz-date"),
+        )
+
+        # Remove auth parameters
+        remove_auth_parameters(request)
+
+        with create_ssl_socket(self.config.get("host"), 443) as ssl_socket:
+            request_bytes = request.to_bytes()
+            print(request_bytes.decode("utf-8"))
+            ssl_socket.sendall(request_bytes)
+            response = ssl_socket.read(65536)
+            print(response.decode("utf-8"))
+            self.assertStartsWith(response, b"HTTP/1.1 403 Forbidden\r\n")
 
 
 if __name__ == "__main__":
