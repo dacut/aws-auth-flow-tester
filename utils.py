@@ -4,10 +4,18 @@ import io
 import socket
 import ssl
 from configparser import ConfigParser
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from functools import cache
+from functools import cache, wraps
+from logging import DEBUG, NOTSET
+from logging import Formatter as BaseLogFormatter
+from logging import Handler as LogHandler
+from logging import StreamHandler, getLogger
 from os import environ
 from os.path import exists
+from random import randint
+from sys import stderr
+from time import strftime
 from types import NoneType
 
 # The default SSL context for secure connections
@@ -58,7 +66,7 @@ class Request:
         path=b"/",
         version=b"HTTP/1.1",
         headers=None,
-        body=b"",
+        body=None,
         timestamp=None,
         config=None,
     ):
@@ -72,7 +80,7 @@ class Request:
         )
         self.set_header(b"x-amz-date", self.timestamp.strftime("%Y%m%dT%H%M%SZ"))
         self.config = config
-        if self.method in (b"POST", b"PUT", b"PATCH") or self.body:
+        if self.body is not None and self.method in (b"POST", b"PUT", b"PATCH"):
             self.set_header(b"content-length", str(len(self.body)).encode("utf-8"))
 
     @property
@@ -153,8 +161,8 @@ class Request:
     def body(self, value):
         if isinstance(value, str):
             value = value.encode("utf-8")
-        elif not isinstance(value, bytes):
-            raise TypeError("HTTP body must be str or bytes")
+        elif not isinstance(value, (bytes, NoneType)):
+            raise TypeError("HTTP body must be str, bytes, or None")
         self._body = value
 
     @property
@@ -189,12 +197,12 @@ class Request:
             result.append(key + b"=" + value)
         return b"&".join(result)
 
-    def add_sigv4_auth(self, signed_headers=None):
+    def add_sigv4_auth(self, signed_headers=None, payload_hash=None):
         """Adds a default SigV4 Authorization header to the request."""
 
         if signed_headers is None:
             signed_headers = (b"content-type", b"host", b"x-amz-date")
-        canonical_request = self.get_canonical_request(signed_headers)
+        canonical_request = self.get_canonical_request(signed_headers=signed_headers, payload_hash=payload_hash)
         signing_key = self.get_signing_key()
         string_to_sign = self.get_string_to_sign(canonical_request)
         signature = self.get_signature(string_to_sign, signing_key)
@@ -244,7 +252,10 @@ class Request:
         canonical_headers = self.get_canonical_headers(signed_headers)
 
         if payload_hash is None:
-            payload_hash = sha256hex(self.body).encode("utf-8")
+            if self.body is None:
+                payload_hash = sha256hex(b"").encode("utf-8")
+            else:
+                payload_hash = sha256hex(self.body).encode("utf-8")
         elif isinstance(payload_hash, str):
             payload_hash = payload_hash.encode("utf-8")
         elif not isinstance(payload_hash, bytes):
@@ -350,7 +361,8 @@ class Request:
         for k, v in self.headers.items():
             result.write(k + b": " + v + b"\r\n")
         result.write(b"\r\n")
-        result.write(self.body)
+        if self.body is not None:
+            result.write(self.body)
         return result.getvalue()
 
 
@@ -372,3 +384,55 @@ def sha256hex(content):
 
     sha256 = hashlib.sha256(content)
     return sha256.hexdigest()
+
+
+class RecordingLogHandler(LogHandler):
+    """Log handler that just records the log events that have happened."""
+    def __init__(self, wrapped, level=NOTSET):
+        super().__init__(level)
+        self.wrapped = wrapped
+        self.do_write = False
+        self.records = []
+    
+    def emit(self, record):
+        self.records.append(record)
+
+    def flush(self):
+        """Flushes all recorded log events to the wrapped handler."""
+        if self.do_write:
+            for record in self.records:
+                self.wrapped.emit(record)
+        self.records.clear()
+
+class Formatter(BaseLogFormatter):
+    """A log formatter that logs times in ISO 8601 using English style decimals."""
+    def formatTime(self, record, datefmt=None):
+        ct = self.converter(record.created)
+        raise ValueError("Not implemented")
+        return strftime("%Y-%m-%dT%H:%M:%S", ct) + f".{int(record.msecs):03d}Z"
+
+
+@contextmanager
+def elog():
+    """Context manager that logs only if an exception leaks out of this context."""
+    base_handler = StreamHandler(stderr)
+    base_handler.setFormatter(Formatter("%(asctime)s [%(levelname)s] %(filename)s %(lineno)d: %(message)s"))
+    handler = RecordingLogHandler(base_handler)
+
+    logger_name = "elog.%08x" % randint(0, 0xFFFFFFFF)
+    logger = getLogger(logger_name)
+
+    handlers = logger.handlers[:]
+    for h in handlers:
+        logger.removeHandler(h)
+
+    logger.propagate = False
+    logger.parent = None
+    logger.addHandler(handler)
+    logger.setLevel(DEBUG)
+    try:
+        yield logger
+    except Exception as e:
+        handler.do_write = True
+        handler.flush()
+        raise
