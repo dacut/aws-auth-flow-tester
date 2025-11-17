@@ -1,8 +1,10 @@
 import hashlib
 import hmac
 import io
+import re
 import socket
 import ssl
+import unittest
 from configparser import ConfigParser
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -408,7 +410,6 @@ class Formatter(BaseLogFormatter):
     """A log formatter that logs times in ISO 8601 using English style decimals."""
     def formatTime(self, record, datefmt=None):
         ct = self.converter(record.created)
-        raise ValueError("Not implemented")
         return strftime("%Y-%m-%dT%H:%M:%S", ct) + f".{int(record.msecs):03d}Z"
 
 
@@ -436,3 +437,29 @@ def elog():
         handler.do_write = True
         handler.flush()
         raise
+
+
+_MULTISPACE = re.compile(r" +")
+
+class TestCase(unittest.TestCase):
+    """A test case that fixes how short descriptions are returned."""
+    
+    def shortDescription(self):
+        """
+        Returns a one-line description of the test, or None if no description has been provided.
+
+        This implementation returns the docstring with newlines and leading spaces removed.
+        """
+        doc = self._testMethodDoc
+        if doc:
+            return _MULTISPACE.sub(" ", doc.strip().replace("\n", " "))
+        return None
+
+
+def hexdump(data, fd=stderr):
+    """Prints a hex dump of the given data to the specified file descriptor."""
+    for i in range(0, len(data), 16):
+        chunk = data[i:i+16]
+        hex_bytes = ' '.join(f"{b:02x}" for b in chunk)
+        ascii_bytes = ''.join((chr(b) if 32 <= b < 127 else '.') for b in chunk)
+        fd.write(f"{i:08x}: {hex_bytes:<48}  {ascii_bytes}\n")
