@@ -204,7 +204,9 @@ class Request:
 
         if signed_headers is None:
             signed_headers = (b"content-type", b"host", b"x-amz-date")
-        canonical_request = self.get_canonical_request(signed_headers=signed_headers, payload_hash=payload_hash)
+        canonical_request = self.get_canonical_request(
+            signed_headers=signed_headers, payload_hash=payload_hash
+        )
         signing_key = self.get_signing_key()
         string_to_sign = self.get_string_to_sign(canonical_request)
         signature = self.get_signature(string_to_sign, signing_key)
@@ -301,7 +303,10 @@ class Request:
             )
         elif algorithm == ALGORITHM_AWS_SIGV4A:
             credential_scope = (
-                timestamp[:8] + b"/" + self.config.get("service").encode("utf-8") + b"/aws4_request"
+                timestamp[:8]
+                + b"/"
+                + self.config.get("service").encode("utf-8")
+                + b"/aws4_request"
             )
         else:
             raise ValueError("Unsupported algorithm: " + algorithm.decode("utf-8"))
@@ -324,7 +329,9 @@ class Request:
                 self.timestamp.strftime("%Y%m%d").encode("utf-8"),
                 hashlib.sha256,
             ).digest()
-            region_key = hmac.new(date_key, self.config.get("region").encode("utf-8"), hashlib.sha256).digest()
+            region_key = hmac.new(
+                date_key, self.config.get("region").encode("utf-8"), hashlib.sha256
+            ).digest()
             service_key = hmac.new(
                 region_key, self.config.get("service").encode("utf-8"), hashlib.sha256
             ).digest()
@@ -390,12 +397,13 @@ def sha256hex(content):
 
 class RecordingLogHandler(LogHandler):
     """Log handler that just records the log events that have happened."""
+
     def __init__(self, wrapped, level=NOTSET):
         super().__init__(level)
         self.wrapped = wrapped
         self.do_write = False
         self.records = []
-    
+
     def emit(self, record):
         self.records.append(record)
 
@@ -406,8 +414,10 @@ class RecordingLogHandler(LogHandler):
                 self.wrapped.emit(record)
         self.records.clear()
 
+
 class Formatter(BaseLogFormatter):
     """A log formatter that logs times in ISO 8601 using English style decimals."""
+
     def formatTime(self, record, datefmt=None):
         ct = self.converter(record.created)
         return strftime("%Y-%m-%dT%H:%M:%S", ct) + f".{int(record.msecs):03d}Z"
@@ -417,7 +427,9 @@ class Formatter(BaseLogFormatter):
 def elog():
     """Context manager that logs only if an exception leaks out of this context."""
     base_handler = StreamHandler(stderr)
-    base_handler.setFormatter(Formatter("%(asctime)s [%(levelname)s] %(filename)s %(lineno)d: %(message)s"))
+    base_handler.setFormatter(
+        Formatter("%(asctime)s [%(levelname)s] %(filename)s %(lineno)d: %(message)s")
+    )
     handler = RecordingLogHandler(base_handler)
 
     logger_name = "elog.%08x" % randint(0, 0xFFFFFFFF)
@@ -441,9 +453,10 @@ def elog():
 
 _MULTISPACE = re.compile(r" +")
 
+
 class TestCase(unittest.TestCase):
     """A test case that fixes how short descriptions are returned."""
-    
+
     def shortDescription(self):
         """
         Returns a one-line description of the test, or None if no description has been provided.
@@ -459,7 +472,7 @@ class TestCase(unittest.TestCase):
 def hexdump(data, fd=stderr):
     """Prints a hex dump of the given data to the specified file descriptor."""
     for i in range(0, len(data), 16):
-        chunk = data[i:i+16]
-        hex_bytes = ' '.join(f"{b:02x}" for b in chunk)
-        ascii_bytes = ''.join((chr(b) if 32 <= b < 127 else '.') for b in chunk)
+        chunk = data[i : i + 16]
+        hex_bytes = " ".join(f"{b:02x}" for b in chunk)
+        ascii_bytes = "".join((chr(b) if 32 <= b < 127 else ".") for b in chunk)
         fd.write(f"{i:08x}: {hex_bytes:<48}  {ascii_bytes}\n")

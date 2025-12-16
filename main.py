@@ -10,8 +10,7 @@ from sys import stdout
 from unittest import main as unittest_main
 from zlib import crc32
 
-from utils import (Request, TestCase, create_ssl_socket, elog, get_config,
-                   hexdump)
+from utils import Request, TestCase, create_ssl_socket, elog, get_config, hexdump
 
 
 def non_root_path(request):
@@ -395,7 +394,8 @@ class S3(TestCase):
             )
             request = Request(
                 method="PUT",
-                path=self.config.get("prefix").encode("utf-8") + b"good-unsigned-single",
+                path=self.config.get("prefix").encode("utf-8")
+                + b"good-unsigned-single",
                 headers={
                     b"host": self.config.get("host").encode("utf-8"),
                     b"content-type": b"application/octet-stream",
@@ -424,7 +424,7 @@ class S3(TestCase):
                 ssl_socket.sendall(body)
                 response = ssl_socket.read(4096)
                 self.assertStartsWith(response, b"HTTP/1.1 200 OK\r\n")
-    
+
     def test_good_streaming_unsigned(self):
         """
         Test a well-formed PUT request to S3 that sets x-amz-content-sha256 to
@@ -451,7 +451,9 @@ class S3(TestCase):
             body.write(b"0\r\n")
 
             # Add the checksum trailer
-            body.write(b"x-amz-checksum-sha256:" + b64encode(hasher.digest()) + b"\r\n\r\n\r\n")
+            body.write(
+                b"x-amz-checksum-sha256:" + b64encode(hasher.digest()) + b"\r\n\r\n\r\n"
+            )
 
             signed_headers = (
                 b"content-type",
@@ -465,7 +467,8 @@ class S3(TestCase):
             )
             request = Request(
                 method="PUT",
-                path=self.config.get("prefix").encode("utf-8") + b"good-streaming-unsigned",
+                path=self.config.get("prefix").encode("utf-8")
+                + b"good-streaming-unsigned",
                 headers={
                     b"host": self.config.get("host").encode("utf-8"),
                     b"content-encoding": b"aws-chunked",
@@ -473,7 +476,9 @@ class S3(TestCase):
                     b"expect": b"100-continue",
                     b"transfer-encoding": b"chunked",
                     b"x-amz-content-sha256": b"STREAMING-UNSIGNED-PAYLOAD-TRAILER",
-                    b"x-amz-decoded-content-length": str(decoded_length).encode("utf-8"),
+                    b"x-amz-decoded-content-length": str(decoded_length).encode(
+                        "utf-8"
+                    ),
                     b"x-amz-sdk-checksum-algorithm": b"SHA256",
                     b"x-amz-trailer": b"x-amz-checksum-sha256",
                 },
@@ -481,7 +486,8 @@ class S3(TestCase):
                 config=self.config,
             )
             request.add_sigv4_auth(
-                signed_headers=signed_headers, payload_hash=b"STREAMING-UNSIGNED-PAYLOAD-TRAILER"
+                signed_headers=signed_headers,
+                payload_hash=b"STREAMING-UNSIGNED-PAYLOAD-TRAILER",
             )
             request.body = None
 
@@ -505,8 +511,10 @@ class S3(TestCase):
                         break
                     log.debug("Sending chunk %d of size %d bytes", chunk_id, len(chunk))
                     chunk_id += 1
-                    ssl_socket.sendall(f"{len(chunk):x}".encode("utf-8") + b"\r\n" + chunk + b"\r\n")
-                
+                    ssl_socket.sendall(
+                        f"{len(chunk):x}".encode("utf-8") + b"\r\n" + chunk + b"\r\n"
+                    )
+
                 log.debug("Sending terminating chunk")
                 ssl_socket.sendall(b"0\r\n\r\n")
                 response = ssl_socket.read(4096)
