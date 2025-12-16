@@ -29,6 +29,12 @@ ALGORITHM_AWS_SIGV4 = b"AWS4-HMAC-SHA256"
 # Algorithm for AWS SigV4a
 ALGORITHM_AWS_SIGV4A = b"AWS4-ECDSA-P256-SHA256"
 
+# Algorithm for AWS SigV4 signed payload chunks
+ALGORITHM_AWS_SIGV4_PAYLOAD = b"AWS4-HMAC-SHA256-PAYLOAD"
+
+# The SHA256 hash of an empty string
+SHA256_EMPTY_STRING_HEXBYTES = hashlib.sha256(b"").hexdigest().encode("utf-8")
+
 # The default AWS region
 DEFAULT_REGION = "us-west-2"
 
@@ -43,6 +49,9 @@ DEFAULT_AWS_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 
 # Default path to use
 DEFAULT_PATH = "/"
+
+
+log = getLogger(__name__)
 
 
 def create_ssl_socket(
@@ -80,7 +89,9 @@ class Request:
         self.timestamp = (
             timestamp if timestamp is not None else datetime.now(timezone.utc)
         )
-        self.set_header(b"x-amz-date", self.timestamp.strftime("%Y%m%dT%H%M%SZ"))
+        self._signing_key = None
+        if b"x-amz-date" not in self.headers:
+            self.set_header(b"x-amz-date", self.timestamp.strftime("%Y%m%dT%H%M%SZ"))
         self.config = config
         if self.body is not None and self.method in (b"POST", b"PUT", b"PATCH"):
             self.set_header(b"content-length", str(len(self.body)).encode("utf-8"))
@@ -209,7 +220,9 @@ class Request:
         )
         signing_key = self.get_signing_key()
         string_to_sign = self.get_string_to_sign(canonical_request)
-        signature = self.get_signature(string_to_sign, signing_key)
+        signature = Request.get_signature(string_to_sign, signing_key)
+        self.seed_signature = signature  # For AWS chunked uploads
+
         credential = (
             self.config.get("aws_access_key_id").encode("utf-8")
             + b"/"
@@ -230,6 +243,15 @@ class Request:
             + signature.encode("utf-8")
         )
         self.set_header(b"authorization", authorization_header)
+
+    def get_chunk_sigv4_auth(self, prev_signature, current_chunk_hash):
+        """Returns the SigV4 signature for a chunk in an AWS chunked upload."""
+        string_to_sign = self.get_chunk_string_to_sign(
+            prev_signature,
+            current_chunk_hash,
+        )
+        signing_key = self.get_signing_key()
+        return Request.get_signature(string_to_sign, signing_key)
 
     def get_canonical_headers(self, signed_headers):
         """Returns the canonical headers for the request."""
@@ -321,8 +343,52 @@ class Request:
             + hashlib.sha256(canonical_request).hexdigest().encode("utf-8")
         )
 
+    def get_chunk_string_to_sign(
+        self,
+        prev_signature,
+        current_chunk_hash,
+    ):
+        """Returns the string to sign for a chunk in an AWS chunked upload."""
+        timestamp = self.timestamp.strftime("%Y%m%dT%H%M%SZ").encode("utf-8")
+
+        credential_scope = (
+            timestamp[:8]
+            + b"/"
+            + self.config.get("region").encode("utf-8")
+            + b"/"
+            + self.config.get("service").encode("utf-8")
+            + b"/aws4_request"
+        )
+
+        if isinstance(prev_signature, str):
+            prev_signature = prev_signature.encode("utf-8")
+        elif not isinstance(prev_signature, bytes):
+            raise TypeError("Previous signature must be str or bytes")
+
+        if isinstance(current_chunk_hash, str):
+            current_chunk_hash = current_chunk_hash.encode("utf-8")
+        elif not isinstance(current_chunk_hash, bytes):
+            raise TypeError("Current chunk hash must be str or bytes")
+
+        return (
+            ALGORITHM_AWS_SIGV4_PAYLOAD
+            + b"\n"
+            + timestamp
+            + b"\n"
+            + credential_scope
+            + b"\n"
+            + prev_signature
+            + b"\n"
+            + SHA256_EMPTY_STRING_HEXBYTES
+            + b"\n"
+            + current_chunk_hash
+        )
+
     def get_signing_key(self, algorithm=ALGORITHM_AWS_SIGV4):
         """Returns the signing key given an AWS secret key."""
+        if self._signing_key is not None:
+            return self._signing_key
+
         if algorithm == ALGORITHM_AWS_SIGV4:
             date_key = hmac.new(
                 b"AWS4" + self.config.get("aws_secret_access_key").encode("utf-8"),
@@ -335,10 +401,10 @@ class Request:
             service_key = hmac.new(
                 region_key, self.config.get("service").encode("utf-8"), hashlib.sha256
             ).digest()
-            signing_key = hmac.new(
+            self._signing_key = hmac.new(
                 service_key, b"aws4_request", hashlib.sha256
             ).digest()
-            return signing_key
+            return self._signing_key
 
         if algorithm == ALGORITHM_AWS_SIGV4A:
             raise NotImplementedError(
@@ -347,7 +413,8 @@ class Request:
 
         raise ValueError("Unsupported algorithm: " + algorithm.decode("utf-8"))
 
-    def get_signature(self, string_to_sign, signing_key, algorithm=ALGORITHM_AWS_SIGV4):
+    @staticmethod
+    def get_signature(string_to_sign, signing_key, algorithm=ALGORITHM_AWS_SIGV4):
         """Returns the signature for the HTTP request."""
 
         if not isinstance(string_to_sign, bytes):
