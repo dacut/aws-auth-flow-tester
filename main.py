@@ -1,11 +1,13 @@
 import socket
 from base64 import b64encode
 from configparser import ConfigParser
+from crc32c import crc32c, CRC32CHash
 from datetime import datetime, timezone
 from functools import cache
 from hashlib import sha256
 from io import BytesIO
 from os import environ
+from struct import pack
 from sys import stdout
 from unittest import main as unittest_main
 from zlib import crc32
@@ -16,7 +18,7 @@ from utils import (
     create_ssl_socket,
     elog,
     get_config,
-    hexdump,
+    ALGORITHM_AWS4_HMAC_SHA256_TRAILER,
     SHA256_EMPTY_STRING_HEXBYTES,
 )
 
@@ -548,7 +550,14 @@ class S3(TestCase):
         """
         with elog() as log:
             raw_chunk_size = 65536
-            http_chunk_size = 16384
+            http_chunk_size = (
+                65536
+                + len(f"{raw_chunk_size:x}")
+                + len(";chunk-signature=")
+                + 64
+                + 2
+                + 2
+            )
             n_chunks = 10
             decoded_length = raw_chunk_size * n_chunks
 
@@ -582,7 +591,6 @@ class S3(TestCase):
                 signed_headers=signed_headers,
                 payload_hash=b"STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
             )
-            request.body = None
 
             with create_ssl_socket(self.config.get("host"), 443) as ssl_socket:
                 request_bytes = request.to_bytes()
@@ -605,6 +613,13 @@ class S3(TestCase):
                 hasher = sha256()
 
                 for i in range(n_chunks):
+                    if ssl_socket.pending() > 0:
+                        response = ssl_socket.read(4096)
+                        self.fail(
+                            "Received unexpected response while still sending data: "
+                            + response.decode("utf-8", errors="ignore")
+                        )
+
                     # Calculate the next chunk signature
                     signature = request.get_chunk_sigv4_auth(
                         prev_signature, raw_chunk_hash
@@ -635,6 +650,155 @@ class S3(TestCase):
                         break
                     log.debug(
                         "Sending HTTP chunk %d of size %d bytes", chunk_id, len(chunk)
+                    )
+                    chunk_nl = chunk.find(b"\r\n")
+                    if chunk_nl >= 0:
+                        chunk_print = chunk[:chunk_nl]
+                    else:
+                        chunk_print = chunk
+
+                    log.debug(
+                        "Chunk start: %s", chunk_print.decode("utf-8", errors="ignore")
+                    )
+                    chunk_id += 1
+                    ssl_socket.sendall(
+                        f"{len(chunk):x}".encode("utf-8") + b"\r\n" + chunk + b"\r\n"
+                    )
+
+                log.debug("Sending terminating chunk")
+                ssl_socket.sendall(b"0\r\n\r\n")
+                response = ssl_socket.read(4096)
+                log.debug("Response:\n%s", response.decode("utf-8", errors="ignore"))
+                self.assertStartsWith(response, b"HTTP/1.1 200 OK\r\n")
+
+    def test_good_streaming_signed_trailer(self):
+        """
+        Test a well-formed PUT request to S3 that sets x-amz-content-sha256 to
+        STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER and uses chunked transfer encoding.
+        """
+        with elog() as log:
+            raw_chunk_size = 65536
+            http_chunk_size = (
+                65536
+                + len(f"{raw_chunk_size:x}")
+                + len(";chunk-signature=")
+                + 64
+                + 2
+                + 2
+            )
+            n_chunks = 10
+            decoded_length = raw_chunk_size * n_chunks
+
+            signed_headers = (
+                b"content-type",
+                b"host",
+                b"transfer-encoding",
+                b"x-amz-content-sha256",
+                b"x-amz-date",
+                b"x-amz-decoded-content-length",
+                b"x-amz-trailer",
+            )
+            request = Request(
+                method="PUT",
+                path=self.config.get("prefix").encode("utf-8")
+                + b"good-streaming-unsigned",
+                headers={
+                    b"host": self.config.get("host").encode("utf-8"),
+                    b"content-encoding": b"aws-chunked",
+                    b"content-type": b"application/octet-stream",
+                    b"expect": b"100-continue",
+                    b"transfer-encoding": b"chunked",
+                    b"x-amz-content-sha256": b"STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+                    b"x-amz-decoded-content-length": str(decoded_length).encode(
+                        "utf-8"
+                    ),
+                    b"x-amz-trailer": b"x-amz-checksum-sha256",
+                },
+                body=None,
+                config=self.config,
+            )
+            request.add_sigv4_auth(
+                signed_headers=signed_headers,
+                payload_hash=b"STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+            )
+
+            with create_ssl_socket(self.config.get("host"), 443) as ssl_socket:
+                request_bytes = request.to_bytes()
+                log.debug(
+                    "Request:\n%s", request_bytes.decode("utf-8", errors="ignore")
+                )
+                ssl_socket.sendall(request_bytes)
+                response = ssl_socket.read(4096)
+                log.debug("Response:\n%s", response.decode("utf-8", errors="ignore"))
+                self.assertStartsWith(response, b"HTTP/1.1 100 Continue\r\n")
+
+                # Get the seed signature from the headers.
+                # See https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-streaming.html#sigv4-chunked-upload-sig-calculation-chunk0
+                prev_signature = request.seed_signature
+
+                # Create the AWS chunked encoded body
+                body = BytesIO()
+                raw_chunk = b"A" * raw_chunk_size
+                raw_chunk_hash = sha256(raw_chunk).hexdigest().encode("utf-8")
+                hasher = sha256()
+
+                for i in range(n_chunks):
+                    if ssl_socket.pending() > 0:
+                        response = ssl_socket.read(4096)
+                        self.fail(
+                            "Received unexpected response while still sending data: "
+                            + response.decode("utf-8", errors="ignore")
+                        )
+
+                    # Calculate the next chunk signature
+                    signature = request.get_chunk_sigv4_auth(
+                        prev_signature, raw_chunk_hash
+                    )
+
+                    body.write(
+                        f"{len(raw_chunk):x};chunk-signature={signature}".encode(
+                            "utf-8"
+                        )
+                        + b"\r\n"
+                    )
+                    body.write(raw_chunk)
+                    body.write(b"\r\n")
+                    hasher.update(raw_chunk)
+                    prev_signature = signature
+
+                # Terminate the aws-chunked body
+                signature = request.get_chunk_sigv4_auth(
+                    prev_signature, SHA256_EMPTY_STRING_HEXBYTES
+                )
+                body.write(f"0;chunk-signature={signature}\r\n".encode("utf-8"))
+                trailer = b"x-amz-checksum-sha256:" + b64encode(hasher.digest())
+                trailer_sig = request.get_trailer_sigv4_auth(
+                    signature, sha256(trailer + b"\n").hexdigest().encode("utf-8")
+                ).encode("utf-8")
+                body.write(
+                    trailer
+                    + b"\r\nx-amz-trailer-signature:"
+                    + trailer_sig
+                    + b"\r\n\r\n"
+                )
+                body.seek(0)
+
+                chunk_id = 1
+                while True:
+                    chunk = body.read(http_chunk_size)
+                    if not chunk:
+                        break
+                    log.debug(
+                        "Sending HTTP chunk %d of size %d bytes", chunk_id, len(chunk)
+                    )
+                    chunk_nl = chunk.find(b"\r\n")
+                    if chunk_nl >= 0 and len(chunk) >= 512:
+                        chunk_print = chunk[:chunk_nl]
+                    else:
+                        chunk_print = chunk
+
+                    log.debug(
+                        "Chunk start: %s", chunk_print.decode("utf-8", errors="ignore")
                     )
                     chunk_id += 1
                     ssl_socket.sendall(
@@ -799,6 +963,194 @@ bf718b6f653bebc184e1479f1935b8da974d701b893afcf49e701f3e2f9f9c5a""",
                 content_length,
                 "Total body length does not match expected value.",
             )
+
+    def test_streaming_signed_trailer_setup(self):
+        """
+        Test that well-formed PUT request to S3 that sets x-amz-content-sha256 to
+        STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER using AWS chunked encoding matches the
+        documentation example code.
+        """
+        with elog() as log:
+            decoded_length = 1024 * 65  # 65 kiB to match the documentation example.
+            content_length = 66824
+            timestamp = datetime(2013, 5, 24, 0, 0, 0, tzinfo=timezone.utc)
+
+            signed_headers = (
+                b"content-encoding",
+                b"host",
+                b"x-amz-content-sha256",
+                b"x-amz-date",
+                b"x-amz-decoded-content-length",
+                b"x-amz-storage-class",
+                b"x-amz-trailer",
+            )
+            request = Request(
+                method="PUT",
+                path=EXAMPLE_CONFIG.get("prefix").encode("utf-8") + b"chunkObject.txt",
+                headers={
+                    b"host": EXAMPLE_CONFIG.get("host").encode("utf-8"),
+                    b"content-encoding": b"aws-chunked",
+                    b"content-length": str(content_length).encode("utf-8"),
+                    b"x-amz-content-sha256": b"STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+                    b"x-amz-decoded-content-length": str(decoded_length).encode(
+                        "utf-8"
+                    ),
+                    b"x-amz-storage-class": b"REDUCED_REDUNDANCY",
+                    b"x-amz-trailer": b"x-amz-checksum-crc32c",
+                },
+                body=None,
+                config=EXAMPLE_CONFIG,
+                timestamp=timestamp,
+            )
+            creq = request.get_canonical_request(
+                signed_headers, b"STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
+            )
+            print(creq)
+            self.assertEqual(
+                creq,
+                b"""\
+PUT
+/examplebucket/chunkObject.txt
+
+content-encoding:aws-chunked
+host:s3.amazonaws.com
+x-amz-content-sha256:STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER
+x-amz-date:20130524T000000Z
+x-amz-decoded-content-length:66560
+x-amz-storage-class:REDUCED_REDUNDANCY
+x-amz-trailer:x-amz-checksum-crc32c
+
+content-encoding;host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length;x-amz-storage-class;x-amz-trailer
+STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER""",
+                "Canonical request does not match expected value.",
+            )
+            string_to_sign = request.get_string_to_sign(creq)
+            self.assertEqual(
+                string_to_sign,
+                b"""\
+AWS4-HMAC-SHA256
+20130524T000000Z
+20130524/us-east-1/s3/aws4_request
+44d48b8c2f70eae815a0198cc73d7a546a73a93359c070abbaa5e6c7de112559""",
+                "String to sign does not match expected value.",
+            )
+            request.add_sigv4_auth(
+                signed_headers=signed_headers,
+                payload_hash=b"STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+            )
+            request.body = None
+
+            request_bytes = request.to_bytes()
+            log.debug("Request:\n%s", request_bytes.decode("utf-8", errors="ignore"))
+
+            self.assertEqual(
+                request.seed_signature,
+                "106e2a8a18243abcf37539882f36619c00e2dfc72633413f02d3b74544bfeb8e",
+                "Seed signature does not match expected value.",
+            )
+
+            body = BytesIO()
+
+            # Create the AWS chunked encoded body
+            chunk1 = b"a" * 65536
+            chunk2 = b"a" * 1024
+            crc_result = b64encode(pack(">I", crc32c(chunk1 + chunk2)))
+            self.assertEqual(
+                crc_result, b"sOO8/Q==", "CRC32C value does not match expected."
+            )
+
+            chunk1_string_to_sign = request.get_chunk_string_to_sign(
+                request.seed_signature, sha256(chunk1).hexdigest().encode("utf-8")
+            )
+            print("Chunk 1 String to Sign:")
+            print(chunk1_string_to_sign.decode("utf-8"))
+            self.assertEqual(
+                chunk1_string_to_sign,
+                b"""\
+AWS4-HMAC-SHA256-PAYLOAD
+20130524T000000Z
+20130524/us-east-1/s3/aws4_request
+106e2a8a18243abcf37539882f36619c00e2dfc72633413f02d3b74544bfeb8e
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+bf718b6f653bebc184e1479f1935b8da974d701b893afcf49e701f3e2f9f9c5a""",
+                "Chunk 1 string to sign does not match expected value.",
+            )
+
+            chunk1_sig = request.get_chunk_sigv4_auth(
+                request.seed_signature, sha256(chunk1).hexdigest().encode("utf-8")
+            )
+            self.assertEqual(
+                chunk1_sig,
+                "b474d8862b1487a5145d686f57f013e54db672cee1c953b3010fb58501ef5aa2",
+                "Chunk 1 signature does not match expected value.",
+            )
+            body.write(
+                f"{len(chunk1):x};chunk-signature={chunk1_sig}".encode("utf-8")
+                + b"\r\n"
+            )
+            body.write(chunk1)
+            body.write(b"\r\n")
+
+            chunk2_sig = request.get_chunk_sigv4_auth(
+                chunk1_sig, sha256(chunk2).hexdigest().encode("utf-8")
+            )
+            self.assertEqual(
+                chunk2_sig,
+                "1c1344b170168f8e65b41376b44b20fe354e373826ccbbe2c1d40a8cae51e5c7",
+                "Chunk 2 signature does not match expected value.",
+            )
+            body.write(
+                f"{len(chunk2):x};chunk-signature={chunk2_sig}".encode("utf-8")
+                + b"\r\n"
+            )
+            body.write(chunk2)
+            body.write(b"\r\n")
+
+            chunk3_sig = request.get_chunk_sigv4_auth(
+                chunk2_sig, SHA256_EMPTY_STRING_HEXBYTES
+            )
+            self.assertEqual(
+                chunk3_sig,
+                "2ca2aba2005185cf7159c6277faf83795951dd77a3a99e6e65d5c9f85863f992",
+                "Chunk 3 signature does not match expected value.",
+            )
+
+            body.write(f"0;chunk-signature={chunk3_sig}\r\n".encode("utf-8"))
+            trailer = b"x-amz-checksum-crc32c:" + crc_result
+            body.write(trailer + b"\n")
+            trailer_sts = request.get_trailer_string_to_sign(
+                chunk3_sig, sha256(trailer + b"\n").hexdigest().encode("utf-8")
+            )
+            self.assertEqual(
+                trailer_sts,
+                b"""\
+AWS4-HMAC-SHA256-TRAILER
+20130524T000000Z
+20130524/us-east-1/s3/aws4_request
+2ca2aba2005185cf7159c6277faf83795951dd77a3a99e6e65d5c9f85863f992
+1e376db7e1a34a8ef1c4bcee131a2d60a1cb62503747488624e10995f448d774""",
+                "Trailer string to sign does not match expected value.",
+            )
+            trailer_sig = request.get_trailer_sigv4_auth(
+                chunk3_sig,
+                sha256(trailer + b"\n").hexdigest().encode("utf-8"),
+            )
+            self.assertEqual(
+                trailer_sig,
+                "d81f82fc3505edab99d459891051a732e8730629a2e4a59689829ca17fe2e435",
+                "Trailer signature does not match expected value.",
+            )
+            body.write(
+                b"x-amz-trailer-signature:" + trailer_sig.encode("utf-8") + b"\r\n"
+            )
+            body.write(b"\r\n")
+
+            # The AWS-documented content-length is incorrect.
+            # self.assertEqual(
+            #     body.tell(),
+            #     content_length,
+            #     "Total body length does not match expected value.",
+            # )
 
 
 if __name__ == "__main__":

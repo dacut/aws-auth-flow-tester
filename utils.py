@@ -24,13 +24,16 @@ from types import NoneType
 SSL_CONTEXT = ssl.create_default_context()
 
 # Algorithm for AWS SigV4
-ALGORITHM_AWS_SIGV4 = b"AWS4-HMAC-SHA256"
+ALGORITHM_AWS4_HMAC_SHA256 = b"AWS4-HMAC-SHA256"
 
 # Algorithm for AWS SigV4a
-ALGORITHM_AWS_SIGV4A = b"AWS4-ECDSA-P256-SHA256"
+ALGORITHM_AWS4_ECDSA_P256_SHA256 = b"AWS4-ECDSA-P256-SHA256"
 
 # Algorithm for AWS SigV4 signed payload chunks
-ALGORITHM_AWS_SIGV4_PAYLOAD = b"AWS4-HMAC-SHA256-PAYLOAD"
+ALGORITHM_AWS4_HMAC_SHA256_PAYLOAD = b"AWS4-HMAC-SHA256-PAYLOAD"
+
+# Algorithm for AWS SigV4 signed payload trailer
+ALGORITHM_AWS4_HMAC_SHA256_TRAILER = b"AWS4-HMAC-SHA256-TRAILER"
 
 # The SHA256 hash of an empty string
 SHA256_EMPTY_STRING_HEXBYTES = hashlib.sha256(b"").hexdigest().encode("utf-8")
@@ -253,6 +256,15 @@ class Request:
         signing_key = self.get_signing_key()
         return Request.get_signature(string_to_sign, signing_key)
 
+    def get_trailer_sigv4_auth(self, prev_signature, trailer_hash):
+        """Returns the SigV4 signature for a trailer in an AWS chunked upload."""
+        string_to_sign = self.get_trailer_string_to_sign(
+            prev_signature,
+            trailer_hash,
+        )
+        signing_key = self.get_signing_key()
+        return Request.get_signature(string_to_sign, signing_key)
+
     def get_canonical_headers(self, signed_headers):
         """Returns the canonical headers for the request."""
         result = []
@@ -302,7 +314,9 @@ class Request:
         )
         return canonical_request
 
-    def get_string_to_sign(self, canonical_request, algorithm=ALGORITHM_AWS_SIGV4):
+    def get_string_to_sign(
+        self, canonical_request, algorithm=ALGORITHM_AWS4_HMAC_SHA256
+    ):
         """Returns the string to sign for the HTTP request."""
         timestamp = self.timestamp.strftime("%Y%m%dT%H%M%SZ").encode("utf-8")
 
@@ -314,7 +328,7 @@ class Request:
         elif not isinstance(algorithm, bytes):
             raise TypeError("Algorithm must be str or bytes")
 
-        if algorithm == ALGORITHM_AWS_SIGV4:
+        if algorithm == ALGORITHM_AWS4_HMAC_SHA256:
             credential_scope = (
                 timestamp[:8]
                 + b"/"
@@ -323,7 +337,7 @@ class Request:
                 + self.config.get("service").encode("utf-8")
                 + b"/aws4_request"
             )
-        elif algorithm == ALGORITHM_AWS_SIGV4A:
+        elif algorithm == ALGORITHM_AWS4_ECDSA_P256_SHA256:
             credential_scope = (
                 timestamp[:8]
                 + b"/"
@@ -371,7 +385,7 @@ class Request:
             raise TypeError("Current chunk hash must be str or bytes")
 
         return (
-            ALGORITHM_AWS_SIGV4_PAYLOAD
+            ALGORITHM_AWS4_HMAC_SHA256_PAYLOAD
             + b"\n"
             + timestamp
             + b"\n"
@@ -384,12 +398,51 @@ class Request:
             + current_chunk_hash
         )
 
-    def get_signing_key(self, algorithm=ALGORITHM_AWS_SIGV4):
+    def get_trailer_string_to_sign(
+        self,
+        prev_signature,
+        trailer_hash,
+    ):
+        """Returns the string to sign for a trailer in an AWS chunked upload."""
+        timestamp = self.timestamp.strftime("%Y%m%dT%H%M%SZ").encode("utf-8")
+
+        credential_scope = (
+            timestamp[:8]
+            + b"/"
+            + self.config.get("region").encode("utf-8")
+            + b"/"
+            + self.config.get("service").encode("utf-8")
+            + b"/aws4_request"
+        )
+
+        if isinstance(prev_signature, str):
+            prev_signature = prev_signature.encode("utf-8")
+        elif not isinstance(prev_signature, bytes):
+            raise TypeError("Previous signature must be str or bytes")
+
+        if isinstance(trailer_hash, str):
+            trailer_hash = trailer_hash.encode("utf-8")
+        elif not isinstance(trailer_hash, bytes):
+            raise TypeError("Trailer hash must be str or bytes")
+
+        return (
+            ALGORITHM_AWS4_HMAC_SHA256_TRAILER
+            + b"\n"
+            + timestamp
+            + b"\n"
+            + credential_scope
+            + b"\n"
+            + prev_signature
+            + b"\n"
+            + trailer_hash
+        )
+
+    def get_signing_key(self, algorithm=ALGORITHM_AWS4_HMAC_SHA256):
         """Returns the signing key given an AWS secret key."""
         if self._signing_key is not None:
             return self._signing_key
 
-        if algorithm == ALGORITHM_AWS_SIGV4:
+        if algorithm == ALGORITHM_AWS4_HMAC_SHA256:
             date_key = hmac.new(
                 b"AWS4" + self.config.get("aws_secret_access_key").encode("utf-8"),
                 self.timestamp.strftime("%Y%m%d").encode("utf-8"),
@@ -406,7 +459,7 @@ class Request:
             ).digest()
             return self._signing_key
 
-        if algorithm == ALGORITHM_AWS_SIGV4A:
+        if algorithm == ALGORITHM_AWS4_ECDSA_P256_SHA256:
             raise NotImplementedError(
                 "SigV4a signing key generation is not yet implemented"
             )
@@ -414,7 +467,9 @@ class Request:
         raise ValueError("Unsupported algorithm: " + algorithm.decode("utf-8"))
 
     @staticmethod
-    def get_signature(string_to_sign, signing_key, algorithm=ALGORITHM_AWS_SIGV4):
+    def get_signature(
+        string_to_sign, signing_key, algorithm=ALGORITHM_AWS4_HMAC_SHA256
+    ):
         """Returns the signature for the HTTP request."""
 
         if not isinstance(string_to_sign, bytes):
@@ -422,9 +477,9 @@ class Request:
         if not isinstance(signing_key, bytes):
             raise TypeError("Signing key must be bytes")
 
-        if algorithm == ALGORITHM_AWS_SIGV4:
+        if algorithm == ALGORITHM_AWS4_HMAC_SHA256:
             return hmac.new(signing_key, string_to_sign, hashlib.sha256).hexdigest()
-        if algorithm == ALGORITHM_AWS_SIGV4A:
+        if algorithm == ALGORITHM_AWS4_ECDSA_P256_SHA256:
             raise NotImplementedError(
                 "SigV4a signature generation is not yet implemented"
             )
