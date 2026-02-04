@@ -10,3 +10,6 @@ dependencies = [
     "isort>=7.0.0",
     "requests>=2.32.5",
 ]
+
+[tool.black]
+line-length = 100

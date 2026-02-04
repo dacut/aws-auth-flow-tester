@@ -590,7 +590,7 @@ class S3(TestCase):
     def test_good_streaming_signed(self):
         """
         Test a well-formed PUT request to S3 that sets x-amz-content-sha256 to
-        STREAMING-AWS4-HMAC-SHA256-PAYLOAD and uses chunked transfer encoding.
+        STREAMING-AWS4-HMAC-SHA256-PAYLOAD and uses aws-chunked content encoding.
         """
         with elog() as log:
             raw_chunk_size = 65536
@@ -718,7 +718,7 @@ class S3(TestCase):
     def test_good_streaming_signed_trailer(self):
         """
         Test a well-formed PUT request to S3 that sets x-amz-content-sha256 to
-        STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER and uses chunked transfer encoding.
+        STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER and uses aws-chunked content encoding.
         """
         with elog() as log:
             raw_chunk_size = 65536
@@ -745,7 +745,7 @@ class S3(TestCase):
             request = Request(
                 method="PUT",
                 path=self.config.get("prefix").encode("utf-8")
-                + b"good-streaming-unsigned",
+                + b"good-streaming-signed-trailer",
                 headers={
                     b"host": self.config.get("host").encode("utf-8"),
                     b"content-encoding": b"aws-chunked",
@@ -968,7 +968,8 @@ class S3(TestCase):
             )
             request = Request(
                 method="PUT",
-                path=self.config.get("prefix").encode("utf-8") + b"good-signed-single",
+                path=self.config.get("prefix").encode("utf-8")
+                + b"bad-single-no-x-amz-content-sha256",
                 headers={
                     b"host": self.config.get("host").encode("utf-8"),
                     b"content-type": b"application/octet-stream",
@@ -1093,7 +1094,7 @@ class S3(TestCase):
             request = Request(
                 method="PUT",
                 path=self.config.get("prefix").encode("utf-8")
-                + b"bad-streaming-malformed-amz-content-sha256",
+                + b"bad-streaming-misencoded-amz-content-sha256",
                 headers={
                     b"host": self.config.get("host").encode("utf-8"),
                     b"content-encoding": b"aws-chunked",
@@ -1137,7 +1138,8 @@ class S3(TestCase):
             )
             request = Request(
                 method="PUT",
-                path=self.config.get("prefix").encode("utf-8") + b"good-signed-single",
+                path=self.config.get("prefix").encode("utf-8")
+                + b"bad-single-truncated-amz-content-sha256",
                 headers={
                     b"host": self.config.get("host").encode("utf-8"),
                     b"content-type": b"application/octet-stream",
@@ -1179,7 +1181,8 @@ class S3(TestCase):
             )
             request = Request(
                 method="PUT",
-                path=self.config.get("prefix").encode("utf-8") + b"good-signed-single",
+                path=self.config.get("prefix").encode("utf-8")
+                + b"bad-single-overlong-amz-content-sha256",
                 headers={
                     b"host": self.config.get("host").encode("utf-8"),
                     b"content-type": b"application/octet-stream",
@@ -1219,7 +1222,7 @@ class S3(TestCase):
             request = Request(
                 method="PUT",
                 path=self.config.get("prefix").encode("utf-8")
-                + b"bad-streaming-signed-missing-amz-content-sha256",
+                + b"bad-streaming-signed-missing-multiple-headers",
                 headers={
                     b"host": self.config.get("host").encode("utf-8"),
                     b"content-encoding": b"aws-chunked",
