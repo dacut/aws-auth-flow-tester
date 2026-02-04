@@ -1122,6 +1122,100 @@ class S3(TestCase):
                 log.debug("Response:\n%s", response.decode("utf-8", errors="ignore"))
                 self.assertStartsWith(response, b"HTTP/1.1 400 Bad Request\r\n")
 
+    def test_bad_streaming_signed_unchunked(self):
+        """
+        Test a malformed PUT request to S3 that sets x-amz-content-sha256 to
+        STREAMING-AWS4-HMAC-SHA256-PAYLOAD and but does not use aws-chunked content encoding.
+        """
+        with elog() as log:
+            raw_chunk_size = 65536
+            http_chunk_size = (
+                65536
+                + len(f"{raw_chunk_size:x}")
+                + len(";chunk-signature=")
+                + 64
+                + 2
+                + 2
+            )
+            n_chunks = 10
+            decoded_length = raw_chunk_size * n_chunks
+
+            signed_headers = (
+                b"content-type",
+                b"host",
+                b"transfer-encoding",
+                b"x-amz-content-sha256",
+                b"x-amz-date",
+                b"x-amz-decoded-content-length",
+            )
+            request = Request(
+                method="PUT",
+                path=self.config.get("prefix").encode("utf-8")
+                + b"good-streaming-unsigned",
+                headers={
+                    b"host": self.config.get("host").encode("utf-8"),
+                    b"content-type": b"application/octet-stream",
+                    b"expect": b"100-continue",
+                    b"transfer-encoding": b"chunked",
+                    b"x-amz-content-sha256": b"STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+                    b"x-amz-decoded-content-length": str(decoded_length).encode(
+                        "utf-8"
+                    ),
+                },
+                body=None,
+                config=self.config,
+            )
+            request.add_sigv4_auth(
+                signed_headers=signed_headers,
+                payload_hash=b"STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            )
+
+            with create_ssl_socket(self.config.get("host"), 443) as ssl_socket:
+                request_bytes = request.to_bytes()
+                log.debug(
+                    "Request:\n%s", request_bytes.decode("utf-8", errors="ignore")
+                )
+                ssl_socket.sendall(request_bytes)
+                response = ssl_socket.read(4096)
+                log.debug("Response:\n%s", response.decode("utf-8", errors="ignore"))
+                self.assertStartsWith(response, b"HTTP/1.1 100 Continue\r\n")
+
+                # Create the encoded body
+                body = BytesIO()
+                raw_chunk = b"A" * raw_chunk_size
+
+                for i in range(n_chunks):
+                    body.write(raw_chunk)
+                body.seek(0)
+
+                chunk_id = 1
+                while True:
+                    chunk = body.read(http_chunk_size)
+                    if not chunk:
+                        break
+                    log.debug(
+                        "Sending HTTP chunk %d of size %d bytes", chunk_id, len(chunk)
+                    )
+                    chunk_nl = chunk.find(b"\r\n")
+                    if chunk_nl >= 0:
+                        chunk_print = chunk[:chunk_nl]
+                    else:
+                        chunk_print = chunk
+
+                    log.debug(
+                        "Chunk start: %s", chunk_print.decode("utf-8", errors="ignore")
+                    )
+                    chunk_id += 1
+                    ssl_socket.sendall(
+                        f"{len(chunk):x}".encode("utf-8") + b"\r\n" + chunk + b"\r\n"
+                    )
+
+                log.debug("Sending terminating chunk")
+                ssl_socket.sendall(b"0\r\n\r\n")
+                response = ssl_socket.read(4096)
+                log.debug("Response:\n%s", response.decode("utf-8", errors="ignore"))
+                self.assertStartsWith(response, b"HTTP/1.1 400 Bad Request\r\n")
+
     def test_bad_single_truncated_amz_content_sha256_header(self):
         """
         Test a malformed streaming PUT request to S3 that sets x-amz-content-sha256 to
