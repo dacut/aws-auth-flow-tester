@@ -398,10 +398,10 @@ class S3(TestCase):
                 log.debug("Response:\n%s", response.decode("utf-8", errors="ignore"))
                 self.assertStartsWith(response, b"HTTP/1.1 200 OK\r\n")
 
-    def test_bad_single_no_x_amz_content_sha256(self):
+    def test_good_signed_single_uppercase(self):
         """
-        Test a malformed PUT request to S3 that does not use aws-chunked encoding and omits the
-        x-amz-content-sha256 header.
+        Test a malformed PUT request to S3 that places the actual payload checksum value into \
+        the x-amz-content-sha256 header in uppercase and uploads the payload in a single chunk.
         """
         with elog() as log:
             body = b"This is the contents of the test object"
@@ -409,15 +409,21 @@ class S3(TestCase):
                 b"content-length",
                 b"content-type",
                 b"host",
+                b"x-amz-content-sha256",
                 b"x-amz-date",
             )
             request = Request(
                 method="PUT",
-                path=self.config.get("prefix").encode("utf-8") + b"good-signed-single",
+                path=self.config.get("prefix").encode("utf-8")
+                + b"good-signed-single-uppercase",
                 headers={
                     b"host": self.config.get("host").encode("utf-8"),
                     b"content-type": b"application/octet-stream",
                     b"content-length": str(len(body)).encode("utf-8"),
+                    b"x-amz-content-sha256": sha256(body)
+                    .hexdigest()
+                    .upper()
+                    .encode("utf-8"),
                     b"Expect": b"100-continue",
                 },
                 body=body,
@@ -947,6 +953,44 @@ class S3(TestCase):
                 log.debug("Response:\n%s", response.decode("utf-8", errors="ignore"))
                 self.assertStartsWith(response, b"HTTP/1.1 200 OK\r\n")
 
+    def test_bad_single_no_x_amz_content_sha256(self):
+        """
+        Test a malformed PUT request to S3 that does not use aws-chunked encoding and omits the
+        x-amz-content-sha256 header.
+        """
+        with elog() as log:
+            body = b"This is the contents of the test object"
+            signed_headers = (
+                b"content-length",
+                b"content-type",
+                b"host",
+                b"x-amz-date",
+            )
+            request = Request(
+                method="PUT",
+                path=self.config.get("prefix").encode("utf-8") + b"good-signed-single",
+                headers={
+                    b"host": self.config.get("host").encode("utf-8"),
+                    b"content-type": b"application/octet-stream",
+                    b"content-length": str(len(body)).encode("utf-8"),
+                    b"Expect": b"100-continue",
+                },
+                body=body,
+                config=self.config,
+            )
+            request.add_sigv4_auth(signed_headers=signed_headers)
+            request.body = None
+
+            with create_ssl_socket(self.config.get("host"), 443) as ssl_socket:
+                request_bytes = request.to_bytes()
+                log.debug(
+                    "Request:\n%s", request_bytes.decode("utf-8", errors="ignore")
+                )
+                ssl_socket.sendall(request_bytes)
+                response = ssl_socket.read(4096)
+                log.debug("Response:\n%s", response.decode("utf-8", errors="ignore"))
+                self.assertStartsWith(response, b"HTTP/1.1 400 Bad Request\r\n")
+
     def test_bad_streaming_signed_missing_decoded_content_length(self):
         """
         Test a malformed PUT request to S3 that sets x-amz-content-sha256 to
@@ -1033,7 +1077,7 @@ class S3(TestCase):
                 log.debug("Response:\n%s", response.decode("utf-8", errors="ignore"))
                 self.assertStartsWith(response, b"HTTP/1.1 400 Bad Request\r\n")
 
-    def test_bad_streaming_malformed_amz_content_sha256_header(self):
+    def test_bad_streaming_misencoded_amz_content_sha256_header(self):
         """
         Test a malformed streaming PUT request to S3 that sets x-amz-content-sha256 to
         invalid bytes (\xff\xff).
@@ -1066,6 +1110,89 @@ class S3(TestCase):
                 signed_headers=signed_headers,
                 payload_hash=b"STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
             )
+
+            with create_ssl_socket(self.config.get("host"), 443) as ssl_socket:
+                request_bytes = request.to_bytes()
+                log.debug(
+                    "Request:\n%s", request_bytes.decode("utf-8", errors="ignore")
+                )
+                ssl_socket.sendall(request_bytes)
+                response = ssl_socket.read(4096)
+                log.debug("Response:\n%s", response.decode("utf-8", errors="ignore"))
+                self.assertStartsWith(response, b"HTTP/1.1 400 Bad Request\r\n")
+
+    def test_bad_single_truncated_amz_content_sha256_header(self):
+        """
+        Test a malformed streaming PUT request to S3 that sets x-amz-content-sha256 to
+        a hex string that is missing characters.
+        """
+        with elog() as log:
+            body = b"This is the contents of the test object"
+            signed_headers = (
+                b"content-length",
+                b"content-type",
+                b"host",
+                b"x-amz-content-sha256",
+                b"x-amz-date",
+            )
+            request = Request(
+                method="PUT",
+                path=self.config.get("prefix").encode("utf-8") + b"good-signed-single",
+                headers={
+                    b"host": self.config.get("host").encode("utf-8"),
+                    b"content-type": b"application/octet-stream",
+                    b"content-length": str(len(body)).encode("utf-8"),
+                    b"x-amz-content-sha256": sha256(body)
+                    .hexdigest()[:-1]
+                    .encode("utf-8"),
+                    b"Expect": b"100-continue",
+                },
+                body=body,
+                config=self.config,
+            )
+            request.add_sigv4_auth(signed_headers=signed_headers)
+            request.body = None
+
+            with create_ssl_socket(self.config.get("host"), 443) as ssl_socket:
+                request_bytes = request.to_bytes()
+                log.debug(
+                    "Request:\n%s", request_bytes.decode("utf-8", errors="ignore")
+                )
+                ssl_socket.sendall(request_bytes)
+                response = ssl_socket.read(4096)
+                log.debug("Response:\n%s", response.decode("utf-8", errors="ignore"))
+                self.assertStartsWith(response, b"HTTP/1.1 400 Bad Request\r\n")
+
+    def test_bad_single_overlong_amz_content_sha256_header(self):
+        """
+        Test a malformed streaming PUT request to S3 that sets x-amz-content-sha256 to
+        a hex string that is has too many characters.
+        """
+        with elog() as log:
+            body = b"This is the contents of the test object"
+            signed_headers = (
+                b"content-length",
+                b"content-type",
+                b"host",
+                b"x-amz-content-sha256",
+                b"x-amz-date",
+            )
+            request = Request(
+                method="PUT",
+                path=self.config.get("prefix").encode("utf-8") + b"good-signed-single",
+                headers={
+                    b"host": self.config.get("host").encode("utf-8"),
+                    b"content-type": b"application/octet-stream",
+                    b"content-length": str(len(body)).encode("utf-8"),
+                    b"x-amz-content-sha256": sha256(body).hexdigest().encode("utf-8")
+                    + b"0",
+                    b"Expect": b"100-continue",
+                },
+                body=body,
+                config=self.config,
+            )
+            request.add_sigv4_auth(signed_headers=signed_headers)
+            request.body = None
 
             with create_ssl_socket(self.config.get("host"), 443) as ssl_socket:
                 request_bytes = request.to_bytes()
