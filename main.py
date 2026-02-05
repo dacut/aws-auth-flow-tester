@@ -1301,6 +1301,66 @@ class S3(TestCase):
                 log.debug("Response:\n%s", response.decode("utf-8", errors="ignore"))
                 self.assertStartsWith(response, b"HTTP/1.1 400 Bad Request\r\n")
 
+    def test_bad_streaming_miscalculated_init_sig(self):
+        """
+        Test a malformed PUT request to S3 that sets x-amz-content-sha256 to
+        STREAMING-AWS4-HMAC-SHA256-PAYLOAD and uses aws-chunked content encoding, but miscalculates
+        the initial signature.
+        """
+        with elog() as log:
+            raw_chunk_size = 65536
+            http_chunk_size = (
+                65536
+                + len(f"{raw_chunk_size:x}")
+                + len(";chunk-signature=")
+                + 64
+                + 2
+                + 2
+            )
+            n_chunks = 10
+            decoded_length = raw_chunk_size * n_chunks
+
+            signed_headers = (
+                b"content-type",
+                b"host",
+                b"transfer-encoding",
+                b"x-amz-content-sha256",
+                b"x-amz-date",
+                b"x-amz-decoded-content-length",
+            )
+            request = Request(
+                method="PUT",
+                path=self.config.get("prefix").encode("utf-8")
+                + b"bad-streaming-miscalculated-init-sig",
+                headers={
+                    b"host": self.config.get("host").encode("utf-8"),
+                    b"content-encoding": b"aws-chunked",
+                    b"content-type": b"application/octet-stream",
+                    b"expect": b"100-continue",
+                    b"transfer-encoding": b"chunked",
+                    b"x-amz-content-sha256": b"STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+                    b"x-amz-decoded-content-length": str(decoded_length).encode(
+                        "utf-8"
+                    ),
+                },
+                body=None,
+                config=self.config,
+            )
+            request.add_sigv4_auth(
+                signed_headers=signed_headers,
+                payload_hash=b"xfoobar",
+            )
+
+            with create_ssl_socket(self.config.get("host"), 443) as ssl_socket:
+                request_bytes = request.to_bytes()
+                log.debug(
+                    "Request:\n%s", request_bytes.decode("utf-8", errors="ignore")
+                )
+                ssl_socket.sendall(request_bytes)
+                response = ssl_socket.read(4096)
+                log.debug("Response:\n%s", response.decode("utf-8", errors="ignore"))
+                self.assertStartsWith(response, b"HTTP/1.1 403 Forbidden\r\n")
+
     def test_bad_streaming_signed_missing_multiple_headers(self):
         """
         Test a malformed streaming PUT request to S3 that omits both the
